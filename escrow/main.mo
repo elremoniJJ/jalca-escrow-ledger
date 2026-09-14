@@ -1,22 +1,10 @@
 import Principal "mo:base/Principal";
 import Result "mo:base/Result";
-import Time "mo:base/Time";
-import Array "mo:base/Array";
-import HashMap "mo:base/HashMap";
-import D "mo:base/Debug";
+import Text "mo:base/Text";
+import Nat64 "mo:base/Nat64";
+import Buffer "mo:base/Buffer";
 
 actor class EscrowCanister() = Self {
-
-  // ==========================================
-  // Configuration & Constants
-  // ==========================================
-  // Mainnet ICP Ledger Principal
-  private let LEDGER_CANISTER_ID = Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai");
-  private let DEFAULT_FEE : Nat = 10_000; // Standard ICP transfer fee (0.0001 ICP)
-  private let TIMEOUT_NANOSEC : Nat64 = 2 * 60 * 60 * 1_000_000_000; // 2 Hours in nanoseconds
-
-  // Allowlisted JALCA Game Canister
-  private var jalcaCanister : Principal = Principal.fromText("py4x3-piaaa-aaaai-ax2ya-cai");
 
   // ==========================================
   // Types & ICRC Ledger Interfaces
@@ -71,60 +59,107 @@ actor class EscrowCanister() = Self {
     #Err : TransferError;
   };
 
-  // External Ledger Interface
-  private let Ledger = actor (Principal.toText(LEDGER_CANISTER_ID)) : service {
-    icrc1_name : () -> (Text) query;
-    icrc2_allowance : (AllowanceArgs) -> (AllowanceResult) query;
-    icrc2_transfer_from : (TransferFromArgs) -> (TransferResult);
-    icrc1_transfer : (TransferArgs) -> (TransferResult);
+  type ICRC1Ledger = actor {
+    icrc1_name : () -> async Text;
+    icrc2_allowance : (AllowanceArgs) -> async AllowanceResult;
+    icrc2_transfer_from : (TransferFromArgs) -> async TransferResult;
+    icrc1_transfer : (TransferArgs) -> async TransferResult;
   };
 
-  // Escrow Internal Types
-  public type Bet = {
-    gameId : Text;
+  public type GameOutcome = { #white; #black; #draw };
+
+  public type PlaceBetArgs = {
     player : Principal;
-    amount : Nat;
-    timestamp : Nat64;
-    settled : Bool;
+    username : Text;
+    anonymous : Bool;
+    pot_tier : Nat; // 1, 10, 100, 1000
+    amount_e8s : Nat;
+    outcome : GameOutcome;
+    wallet_address : Text;
+  };
+
+  public type StartGameArgs = {
+    game_id : Text;
+    start_time : Nat;
+  };
+
+  public type ReportOutcomeArgs = {
+    game_id : Text;
+    result : GameOutcome;
+    end_time : Nat;
+  };
+
+  public type BetRecord = {
+    player : Principal;
+    username : Text;
+    anonymous : Bool;
+    pot_tier : Nat;
+    amount_e8s : Nat;
+    outcome : GameOutcome;
+    wallet_address : Text;
   };
 
   public type EscrowError = {
     #Unauthorized;
+    #NoApproval;
     #InsufficientAllowance;
     #TransferFailed : Text;
-    #GameNotFound;
-    #AlreadySettled;
-    #TimeoutNotReached;
+    #InvalidTier;
+    #NoActiveGame;
   };
 
-  // State Storage
-  private var activeBets = HashMap.HashMap<Text, Bet>(10, Text.equal, Text.hash);
-  private var pastResults = HashMap.HashMap<Text, Text>(10, Text.equal, Text.hash);
+  // ==========================================
+  // Configuration & Constants
+  // ==========================================
+  private let LEDGER_CANISTER_ID = Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai");
+  private let DEFAULT_FEE : Nat = 10_000; // Standard ICP transfer fee (0.0001 ICP)
+
+  // NNS Fee Recipient Wallet Principal
+  private let NNS_FEE_PRINCIPAL = Principal.fromText("hptl6-tqed6-6n3xt-ed7mo-mcsop-yquko-lbhii-je7yn-j4i5t-pjsw4-5ae");
+
+  // Allowlisted JALCA Game Canister
+  private var jalcaCanister : Principal = Principal.fromText("py4x3-piaaa-aaaai-ax2ya-cai");
+
+  // Ledger Instance
+  private let Ledger : ICRC1Ledger = actor (Principal.toText(LEDGER_CANISTER_ID));
 
   // ==========================================
-  // Authorization Helper
+  // Double-Buffered Pot Storage
   // ==========================================
+  private var nextGamePots : [BetRecord] = [];
+  private var lockedGamePots : ?(Text, [BetRecord]) = null; // (game_id, bets)
+
+  // Helper: Verify JALCA Caller
   private func isJalcaCaller(caller : Principal) : Bool {
     return caller == jalcaCanister;
   };
 
-  // ==========================================
-  // JALCA Update Endpoints
-  // ==========================================
-
-  public shared(msg) func test_echo(payload : Text) : async Text {
-    if (not isJalcaCaller(msg.caller)) {
-      D.trap("Unauthorized caller");
+  // Helper: Outcome Match
+  private func isMatchingOutcome(predicted : GameOutcome, actual : GameOutcome) : Bool {
+    switch (predicted, actual) {
+      case (#white, #white) true;
+      case (#black, #black) true;
+      case (#draw, #draw) true;
+      case (_) false;
     };
-    return "JEL Echo: " # payload;
   };
 
-  public shared(msg) func place_bet(gameId : Text, playerPrincipal : Principal, amount : Nat) : async Result.Result<Nat, EscrowError> {
+  // ==========================================
+  // JALCA Interface Endpoints
+  // ==========================================
+
+  // 1. Incoming Bet — place_bet
+  public shared(msg) func place_bet(args : PlaceBetArgs) : async Result.Result<Nat, EscrowError> {
     if (not isJalcaCaller(msg.caller)) {
       return #err(#Unauthorized);
     };
 
-    let playerAccount : Account = { owner = playerPrincipal; subaccount = null };
+    // Verify valid tier
+    if (args.pot_tier != 1 and args.pot_tier != 10 and args.pot_tier != 100 and args.pot_tier != 1000) {
+      return #err(#InvalidTier);
+    };
+
+    let playerAccount : Account = { owner = args.player; subaccount = null };
     let jelAccount : Account = { owner = Principal.fromActor(Self); subaccount = null };
 
     let allowanceRes = await Ledger.icrc2_allowance({
@@ -132,7 +167,11 @@ actor class EscrowCanister() = Self {
       spender = jelAccount;
     });
 
-    if (allowanceRes.allowance < amount + DEFAULT_FEE) {
+    if (allowanceRes.allowance == 0) {
+      return #err(#NoApproval);
+    };
+
+    if (allowanceRes.allowance < args.amount_e8s + DEFAULT_FEE) {
       return #err(#InsufficientAllowance);
     };
 
@@ -140,7 +179,7 @@ actor class EscrowCanister() = Self {
       spender_subaccount = null;
       from = playerAccount;
       to = jelAccount;
-      amount = amount;
+      amount = args.amount_e8s;
       fee = ?DEFAULT_FEE;
       memo = null;
       created_at_time = null;
@@ -148,107 +187,120 @@ actor class EscrowCanister() = Self {
 
     switch (transferRes) {
       case (#Ok(blockIndex)) {
-        let newBet : Bet = {
-          gameId = gameId;
-          player = playerPrincipal;
-          amount = amount;
-          timestamp = Time.now();
-          settled = false;
+        let newBet : BetRecord = {
+          player = args.player;
+          username = args.username;
+          anonymous = args.anonymous;
+          pot_tier = args.pot_tier;
+          amount_e8s = args.amount_e8s;
+          outcome = args.outcome;
+          wallet_address = args.wallet_address;
         };
-        activeBets.put(gameId, newBet);
+
+        let buf = Buffer.fromArray<BetRecord>(nextGamePots);
+        buf.add(newBet);
+        nextGamePots := Buffer.toArray(buf);
+
         return #ok(blockIndex);
       };
       case (#Err(_)) {
-        return #err(#TransferFailed("ICRC2 Transfer From Failed"));
+        return #err(#TransferFailed("ICRC2 Pull Failed"));
       };
     };
   };
 
-  public shared(msg) func report_outcome(gameId : Text, winnerPrincipal : Principal) : async Result.Result<Nat, EscrowError> {
+  // 2. Game Start — start_game
+  public shared(msg) func start_game(args : StartGameArgs) : async Result.Result<(), EscrowError> {
     if (not isJalcaCaller(msg.caller)) {
       return #err(#Unauthorized);
     };
 
-    switch (activeBets.get(gameId)) {
-      case (null) { return #err(#GameNotFound); };
-      case (?bet) {
-        if (bet.settled) { return #err(#AlreadySettled); };
+    // Lock current next-game pots and open a fresh set
+    lockedGamePots := ?(args.game_id, nextGamePots);
+    nextGamePots := [];
 
-        let feeAmount = (bet.amount * 1) / 1000;
-        let payoutAmount = bet.amount - feeAmount - DEFAULT_FEE;
-
-        let winnerAccount : Account = { owner = winnerPrincipal; subaccount = null };
-
-        let payoutRes = await Ledger.icrc1_transfer({
-          from_subaccount = null;
-          to = winnerAccount;
-          amount = payoutAmount;
-          fee = ?DEFAULT_FEE;
-          memo = null;
-          created_at_time = null;
-        });
-
-        switch (payoutRes) {
-          case (#Ok(blockIndex)) {
-            let updatedBet = { bet with settled = true };
-            activeBets.put(gameId, updatedBet);
-            pastResults.put(gameId, "Winner: " # Principal.toText(winnerPrincipal));
-            return #ok(blockIndex);
-          };
-          case (#Err(_)) {
-            return #err(#TransferFailed("Payout Transfer Failed"));
-          };
-        };
-      };
-    };
+    return #ok(());
   };
 
-  public shared(msg) func refund_timeout(gameId : Text) : async Result.Result<Nat, EscrowError> {
+  // 3. Game Conclusion — report_outcome
+  public shared(msg) func report_outcome(args : ReportOutcomeArgs) : async Result.Result<(), EscrowError> {
     if (not isJalcaCaller(msg.caller)) {
       return #err(#Unauthorized);
     };
 
-    switch (activeBets.get(gameId)) {
-      case (null) { return #err(#GameNotFound); };
-      case (?bet) {
-        if (bet.settled) { return #err(#AlreadySettled); };
+    switch (lockedGamePots) {
+      case (null) { return #err(#NoActiveGame); };
+      case (?(_, bets)) {
+        
+        let tiers : [Nat] = [1, 10, 100, 1000];
 
-        let now = Time.now();
-        if (now - bet.timestamp < TIMEOUT_NANOSEC) {
-          return #err(#TimeoutNotReached);
+        // Process each tier independently
+        for (tier in tiers.vals()) {
+          var tierTotal : Nat = 0;
+          let tierBetsBuf = Buffer.Buffer<BetRecord>(0);
+          let winningBetsBuf = Buffer.Buffer<BetRecord>(0);
+
+          for (b in bets.vals()) {
+            if (b.pot_tier == tier) {
+              tierTotal += b.amount_e8s;
+              tierBetsBuf.add(b);
+
+              if (isMatchingOutcome(b.outcome, args.result)) {
+                winningBetsBuf.add(b);
+              };
+            };
+          };
+
+          if (tierTotal > 0) {
+            // Deduct 0.1% Owner Fee (1 / 1000)
+            let feeAmount = tierTotal / 1000;
+            let netPot = tierTotal - feeAmount;
+
+            // Safe Fee Transfer (Transfers full feeAmount; ledger deducts DEFAULT_FEE from canister)
+            if (feeAmount > DEFAULT_FEE) {
+              ignore await Ledger.icrc1_transfer({
+                from_subaccount = null;
+                to = { owner = NNS_FEE_PRINCIPAL; subaccount = null };
+                amount = feeAmount;
+                fee = ?DEFAULT_FEE;
+                memo = null;
+                created_at_time = null;
+              });
+            };
+
+            // Distribute remaining pot
+            let recipientsBuf = if (winningBetsBuf.size() > 0) winningBetsBuf else tierBetsBuf;
+            if (recipientsBuf.size() > 0) {
+              let sharePerRecipient = netPot / recipientsBuf.size();
+
+              // Safe Payout Transfer (Transfers full share; ledger deducts DEFAULT_FEE from canister)
+              if (sharePerRecipient > DEFAULT_FEE) {
+                for (r in recipientsBuf.vals()) {
+                  ignore await Ledger.icrc1_transfer({
+                    from_subaccount = null;
+                    to = { owner = r.player; subaccount = null };
+                    amount = sharePerRecipient;
+                    fee = ?DEFAULT_FEE;
+                    memo = null;
+                    created_at_time = null;
+                  });
+                };
+              };
+            };
+          };
         };
 
-        let playerAccount : Account = { owner = bet.player; subaccount = null };
-        let refundAmount = bet.amount - DEFAULT_FEE;
-
-        let refundRes = await Ledger.icrc1_transfer({
-          from_subaccount = null;
-          to = playerAccount;
-          amount = refundAmount;
-          fee = ?DEFAULT_FEE;
-          memo = null;
-          created_at_time = null;
-        });
-
-        switch (refundRes) {
-          case (#Ok(blockIndex)) {
-            let updatedBet = { bet with settled = true };
-            activeBets.put(gameId, updatedBet);
-            pastResults.put(gameId, "Refunded to Player");
-            return #ok(blockIndex);
-          };
-          case (#Err(_)) {
-            return #err(#TransferFailed("Refund Transfer Failed"));
-          };
-        };
+        // Clear locked pots
+        lockedGamePots := null;
+        return #ok(());
       };
     };
   };
 
   // ==========================================
-  // Public Query Endpoints
+  // Public Inter-Canister & Query Endpoints
   // ==========================================
-  public query func testLedgerConnection() : async Text {
+  public shared func testLedgerConnection() : async Text {
     try {
       let name = await Ledger.icrc1_name();
       return "Connected to ledger: " # name;

@@ -1,0 +1,55 @@
+type StartGameArgs = 
+ record {
+   game_id: text;
+   start_time: nat;
+ };
+type Result_1 = 
+ variant {
+   err: EscrowError;
+   ok: nat;
+ };
+type Result = 
+ variant {
+   err: EscrowError;
+   ok;
+ };
+type ReportOutcomeArgs = 
+ record {
+   end_time: nat;
+   game_id: text;
+   result: GameOutcome;
+ };
+type PlaceBetArgs = 
+ record {
+   amount_e8s: nat;
+   anonymous: bool;
+   outcome: GameOutcome;
+   player: principal;
+   pot_tier: nat;
+   username: text;
+   wallet_address: text;
+ };
+type GameOutcome = 
+ variant {
+   black;
+   draw;
+   white;
+ };
+type EscrowError = 
+ variant {
+   InsufficientAllowance;
+   InvalidTier;
+   NoActiveGame;
+   NoApproval;
+   TransferFailed: text;
+   Unauthorized;
+ };
+type EscrowCanister = 
+ service {
+   getAllowlist: () -> (principal) query;
+   place_bet: (PlaceBetArgs) -> (Result_1);
+   report_outcome: (ReportOutcomeArgs) -> (Result);
+   start_game: (StartGameArgs) -> (Result);
+   testLedgerConnection: () -> (text);
+ };
+service : () -> EscrowCanister
