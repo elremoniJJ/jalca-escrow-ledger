@@ -4,6 +4,28 @@ export const idlFactory = ({ IDL }) => {
     'black' : IDL.Null,
     'white' : IDL.Null,
   });
+  const BetRecord = IDL.Record({
+    'username' : IDL.Text,
+    'player' : IDL.Principal,
+    'wallet_address' : IDL.Text,
+    'pot_tier' : IDL.Nat,
+    'anonymous' : IDL.Bool,
+    'amount_e8s' : IDL.Nat,
+    'outcome' : GameOutcome,
+  });
+  const TierSummary = IDL.Record({
+    'winning_bets' : IDL.Nat,
+    'total_pot_e8s' : IDL.Nat,
+    'total_bets' : IDL.Nat,
+    'pot_tier' : IDL.Nat,
+  });
+  const GameHistoryRecord = IDL.Record({
+    'result' : GameOutcome,
+    'bets' : IDL.Vec(BetRecord),
+    'end_time' : IDL.Nat,
+    'game_id' : IDL.Text,
+    'tier_summaries' : IDL.Vec(TierSummary),
+  });
   const PlaceBetArgs = IDL.Record({
     'username' : IDL.Text,
     'player' : IDL.Principal,
@@ -34,6 +56,13 @@ export const idlFactory = ({ IDL }) => {
   });
   const EscrowCanister = IDL.Service({
     'getAllowlist' : IDL.Func([], [IDL.Principal], ['query']),
+    'getGameHistory' : IDL.Func([], [IDL.Vec(GameHistoryRecord)], ['query']),
+    'getLockedGamePots' : IDL.Func(
+        [],
+        [IDL.Opt(IDL.Tuple(IDL.Text, IDL.Vec(BetRecord)))],
+        ['query'],
+      ),
+    'getNextGamePots' : IDL.Func([], [IDL.Vec(BetRecord)], ['query']),
     'place_bet' : IDL.Func([PlaceBetArgs], [Result_1], []),
     'report_outcome' : IDL.Func([ReportOutcomeArgs], [Result], []),
     'start_game' : IDL.Func([StartGameArgs], [Result], []),

@@ -1,3 +1,10 @@
+type TierSummary = 
+ record {
+   pot_tier: nat;
+   total_bets: nat;
+   total_pot_e8s: nat;
+   winning_bets: nat;
+ };
 type StartGameArgs = 
  record {
    game_id: text;
@@ -35,6 +42,14 @@ type GameOutcome =
    draw;
    white;
  };
+type GameHistoryRecord = 
+ record {
+   bets: vec BetRecord;
+   end_time: nat;
+   game_id: text;
+   result: GameOutcome;
+   tier_summaries: vec TierSummary;
+ };
 type EscrowError = 
  variant {
    InsufficientAllowance;
@@ -47,9 +62,25 @@ type EscrowError =
 type EscrowCanister = 
  service {
    getAllowlist: () -> (principal) query;
+   getGameHistory: () -> (vec GameHistoryRecord) query;
+   getLockedGamePots: () -> (opt record {
+                                   text;
+                                   vec BetRecord;
+                                 }) query;
+   getNextGamePots: () -> (vec BetRecord) query;
    place_bet: (PlaceBetArgs) -> (Result_1);
    report_outcome: (ReportOutcomeArgs) -> (Result);
    start_game: (StartGameArgs) -> (Result);
    testLedgerConnection: () -> (text);
+ };
+type BetRecord = 
+ record {
+   amount_e8s: nat;
+   anonymous: bool;
+   outcome: GameOutcome;
+   player: principal;
+   pot_tier: nat;
+   username: text;
+   wallet_address: text;
  };
 service : () -> EscrowCanister
