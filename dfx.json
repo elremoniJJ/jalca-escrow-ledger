@@ -2,7 +2,8 @@
   "canisters": {
     "jel-escrow": {
       "main": "escrow/main.mo",
-      "type": "motoko"
+      "type": "motoko",
+      "args": "--legacy-persistence"
     }
   },
   "defaults": {

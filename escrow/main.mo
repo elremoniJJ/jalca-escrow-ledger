@@ -8,7 +8,7 @@ import Timer "mo:base/Timer";
 import Time "mo:base/Time";
 import Error "mo:base/Error"; // CHANGED: needed to catch ledger call failures
 
-actor class EscrowCanister() = Self {
+persistent actor class EscrowCanister() = Self {
 
   // ==========================================
   // Types & ICRC Ledger Interfaces
@@ -68,6 +68,7 @@ actor class EscrowCanister() = Self {
     icrc2_allowance : (AllowanceArgs) -> async AllowanceResult;
     icrc2_transfer_from : (TransferFromArgs) -> async TransferResult;
     icrc1_transfer : (TransferArgs) -> async TransferResult;
+    icrc1_balance_of : (Account) -> async Nat;
   };
 
   public type GameOutcome = { #white; #black; #draw };
@@ -141,24 +142,24 @@ actor class EscrowCanister() = Self {
   // ==========================================
   // Configuration & Constants
   // ==========================================
-  private let LEDGER_CANISTER_ID = Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai");
-  private let DEFAULT_FEE : Nat = 10_000; // Standard ICP transfer fee (0.0001 ICP)
+  private transient let LEDGER_CANISTER_ID = Principal.fromText("ryjl3-tyaaa-aaaaa-aaaba-cai");
+  private transient let DEFAULT_FEE : Nat = 10_000; // Standard ICP transfer fee (0.0001 ICP)
 
   // CHANGED: platform fee in basis points. 150 bps = 1.5%. (Was: tierTotal / 1000 = 0.1%)
-  private let FEE_BPS : Nat = 150;
-  private let BPS_DENOMINATOR : Nat = 10_000;
+  private transient let FEE_BPS : Nat = 150;
+  private transient let BPS_DENOMINATOR : Nat = 10_000;
 
   // 2 Hours Safety Timeout in Nanoseconds
-  private let TWO_HOURS_NS : Nat = 2 * 60 * 60 * 1_000_000_000;
+  private transient let TWO_HOURS_NS : Nat = 2 * 60 * 60 * 1_000_000_000;
 
   // NNS Fee Recipient Wallet Principal
-  private let NNS_FEE_PRINCIPAL = Principal.fromText("hptl6-tqed6-6n3xt-ed7mo-mcsop-yquko-lbhii-je7yn-j4i5t-pjsw4-5ae");
+  private transient let NNS_FEE_PRINCIPAL = Principal.fromText("hptl6-tqed6-6n3xt-ed7mo-mcsop-yquko-lbhii-je7yn-j4i5t-pjsw4-5ae");
 
   // Allowlisted JALCA Game Canister
-  private var jalcaCanister : Principal = Principal.fromText("py4x3-piaaa-aaaai-ax2ya-cai");
+  private transient var jalcaCanister : Principal = Principal.fromText("py4x3-piaaa-aaaai-ax2ya-cai");
 
   // Ledger Instance
-  private let Ledger : ICRC1Ledger = actor (Principal.toText(LEDGER_CANISTER_ID));
+  private transient let Ledger : ICRC1Ledger = actor (Principal.toText(LEDGER_CANISTER_ID));
 
   // ==========================================
   // State Storage
@@ -176,7 +177,7 @@ actor class EscrowCanister() = Self {
   // CHANGED: log of failed transfers, for reconciliation
   private stable var failedTransfers : [FailedTransfer] = [];
 
-  private var activeGameTimerId : ?Timer.TimerId = null;
+  private transient var activeGameTimerId : ?Timer.TimerId = null;
 
   // Helper: Verify JALCA Caller
   private func isJalcaCaller(caller : Principal) : Bool {
@@ -549,5 +550,56 @@ actor class EscrowCanister() = Self {
 
   public query func getAllowlist() : async Principal {
     return jalcaCanister;
+  };
+
+  // ==========================================
+  // Owner-only: recover surplus ICP
+  // ==========================================
+  // Sends ICP that is NOT committed to any bet to the NNS wallet. It never
+  // touches money held for bets, always keeps MIN_KEEP_E8S in the canister,
+  // only runs between games, and can only send to NNS_FEE_PRINCIPAL.
+  private transient let MIN_KEEP_E8S : Nat = 20_000_000; // always keep 0.2 ICP
+  private transient var withdrawing : Bool = false;
+
+  public shared(msg) func withdrawSurplus(amount : Nat, confirm : Text) : async Result.Result<Nat, Text> {
+    if (not Principal.isController(msg.caller)) { return #err("unauthorized"); };
+    if (confirm != "WITHDRAW") { return #err("type WITHDRAW to confirm"); };
+    if (withdrawing) { return #err("busy, retry"); };
+    switch (lockedGamePots) {
+      case (?_) { return #err("a game is in progress, retry between games"); };
+      case (null) { };
+    };
+    withdrawing := true;
+    let r = try { await doWithdrawSurplus(amount) } catch (e) {
+      #err("outcome unknown, check the balance before retrying: " # Error.message(e))
+    };
+    withdrawing := false;
+    r;
+  };
+
+  private func doWithdrawSurplus(amount : Nat) : async Result.Result<Nat, Text> {
+    if (amount == 0) { return #err("amount must be above zero"); };
+    var committed : Nat = 0;
+    for (b in nextGamePots.vals()) { committed += b.amount_e8s; };
+    switch (lockedGamePots) {
+      case (?(_, bets)) { for (b in bets.vals()) { committed += b.amount_e8s; }; };
+      case (null) { };
+    };
+    let bal = await Ledger.icrc1_balance_of({ owner = Principal.fromActor(Self); subaccount = null });
+    if (bal < committed + MIN_KEEP_E8S + amount + DEFAULT_FEE) {
+      return #err("would dip into bets or the safety buffer");
+    };
+    let res = await Ledger.icrc1_transfer({
+      from_subaccount = null;
+      to = { owner = NNS_FEE_PRINCIPAL; subaccount = null };
+      amount = amount;
+      fee = ?DEFAULT_FEE;
+      memo = null;
+      created_at_time = null;
+    });
+    switch (res) {
+      case (#Ok(block)) { #ok(block) };
+      case (#Err(e)) { #err("ledger rejected the transfer: " # debug_show (e)) };
+    };
   };
 };
